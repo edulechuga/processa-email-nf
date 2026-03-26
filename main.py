@@ -48,14 +48,14 @@ def init_outlook():
         )
         
         scopes = ["https://outlook.office.com/Mail.Read", "offline_access"]
-        flow = app.initiate_device_code_flow(scopes=scopes)
+        flow = app.initiate_device_flow(scopes=scopes)
         
         print(f"\n1. Em outro dispositivo, vá para: {flow['verification_uri']}")
         print(f"2. Digite o código: {flow['user_code']}")
         print("3. Faça login com sua conta corporativa")
         print("4. Aguarde aqui...\n")
         
-        result = app.acquire_token_by_device_code_flow(flow)
+        result = app.acquire_token_by_device_flow(flow)
         
         if "access_token" in result:
             # Salva o token
