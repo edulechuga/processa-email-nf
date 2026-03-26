@@ -29,7 +29,7 @@ LLM_MODEL = "google/gemini-2.5-flash"
 # FUNÇÕES DE INICIALIZAÇÃO
 # ==========================================
 def init_outlook():
-    """Conecta ao Microsoft Graph API usando Fluxo Delegado (User Consent)."""
+    """Conecta ao Microsoft Graph API usando Device Code Flow."""
     credentials = (os.getenv("MS_CLIENT_ID"), os.getenv("MS_CLIENT_SECRET"))
     tenant_id = os.getenv("MS_TENANT_ID")
     token_backend = FileSystemTokenBackend(token_path='.', token_filename='token.json')
@@ -39,12 +39,31 @@ def init_outlook():
         print("\n" + "="*50)
         print(" ATENÇÃO: AUTENTICAÇÃO INICIAL NECESSÁRIA")
         print("="*50)
-        print("1. Copie o link abaixo.")
-        print("2. Cole no navegador do seu computador e faça login com seu e-mail corporativo.")
-        print("3. Aceite as permissões.")
-        print("4. Copie a URL final (mesmo que dê erro na página) e cole de volta aqui.\n")
-        account.authenticate(scopes=['basic', 'message_all'])
-        print("\nAutenticação concluída! O arquivo token.json foi salvo.")
+        
+        # Device Code Flow
+        import msal
+        app = msal.PublicClientApplication(
+            credentials[0],
+            authority=f"https://login.microsoftonline.com/{tenant_id}"
+        )
+        
+        scopes = ["https://outlook.office.com/Mail.Read", "offline_access"]
+        flow = app.initiate_device_code_flow(scopes=scopes)
+        
+        print(f"\n1. Em outro dispositivo, vá para: {flow['verification_uri']}")
+        print(f"2. Digite o código: {flow['user_code']}")
+        print("3. Faça login com sua conta corporativa")
+        print("4. Aguarde aqui...\n")
+        
+        result = app.acquire_token_by_device_code_flow(flow)
+        
+        if "access_token" in result:
+            # Salva o token
+            token_backend.save_token(result)
+            print("Autenticação concluída! O arquivo token.json foi salvo.")
+        else:
+            print(f"Erro na autenticação: {result.get('error', 'Unknown')}")
+            raise Exception("Falha na autenticação")
         
     return account.mailbox()
 
