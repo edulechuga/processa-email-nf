@@ -30,57 +30,23 @@ LLM_MODEL = "google/gemini-2.5-flash"
 # FUNÇÕES DE INICIALIZAÇÃO
 # ==========================================
 def init_outlook():
-    """Conecta ao Microsoft Graph API usando credenciais de usuário (ROPC)."""
-    client_id = os.getenv("MS_CLIENT_ID")
-    client_secret = os.getenv("MS_CLIENT_SECRET")
+    """Conecta ao Microsoft Graph API usando fluxo de autenticação."""
+    credentials = (os.getenv("MS_CLIENT_ID"), os.getenv("MS_CLIENT_SECRET"))
     tenant_id = os.getenv("MS_TENANT_ID")
-    username = os.getenv("MS_USERNAME")
-    password = os.getenv("MS_PASSWORD")
-    
-    if not all([client_id, client_secret, tenant_id, username, password]):
-        print("\n" + "="*50)
-        print("ERRO: Configuração incompleta no .env")
-        print("Adicione MS_USERNAME e MS_PASSWORD")
-        print("="*50 + "\n")
-        raise Exception("Credenciais incompletas")
-    
-    # ROPC - Resource Owner Password Credentials
-    token_url = f"https://login.microsoftonline.com/{tenant_id}/oauth2/v2.0/token"
-    
-    data = {
-        "grant_type": "password",
-        "client_id": client_id,
-        "client_secret": client_secret,
-        "scope": "https://outlook.office.com/Mail.Read offline_access",
-        "username": username,
-        "password": password
-    }
-    
-    response = requests.post(token_url, data=data)
-    
-    if response.status_code != 200:
-        print(f"Erro na autenticação: {response.json()}")
-        raise Exception("Falha no login ROPC")
-    
-    token_data = response.json()
-    
-    # Salva o token
     token_backend = FileSystemTokenBackend(token_path='.', token_filename='token.json')
-    token_info = {
-        "access_token": token_data["access_token"],
-        "token_type": token_data.get("token_type", "Bearer"),
-        "expires_in": token_data.get("expires_in", 3600),
-        "scope": token_data.get("scope", ""),
-        "expires_at": int(time.time()) + token_data.get("expires_in", 3600),
-        "refresh_token": token_data.get("refresh_token", "")
-    }
-    token_backend.save_token(token_info)
-    
-    # Cria account
-    credentials = (client_id, client_secret)
     account = Account(credentials, tenant_id=tenant_id, token_backend=token_backend)
     
-    print("Autenticação via ROPC concluída!")
+    if not account.is_authenticated:
+        print("\n" + "="*50)
+        print(" ATENÇÃO: AUTENTICAÇÃO INICIAL NECESSÁRIA")
+        print("="*50)
+        print("1. Copie o link abaixo.")
+        print("2. Cole no navegador e faça login.")
+        print("3. Aceite as permissões.")
+        print("4. Cole a URL final aqui.\n")
+        account.authenticate(scopes=['basic', 'message_all'])
+        print("\nAutenticação concluída!")
+        
     return account.mailbox()
 
 def init_openrouter():
