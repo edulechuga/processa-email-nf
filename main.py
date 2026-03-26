@@ -29,7 +29,7 @@ LLM_MODEL = "google/gemini-2.5-flash"
 # FUNÇÕES DE INICIALIZAÇÃO
 # ==========================================
 def init_outlook():
-    """Conecta ao Microsoft Graph API usando Device Code Flow."""
+    """Conecta ao Microsoft Graph API usando fluxo de autorização padrão."""
     credentials = (os.getenv("MS_CLIENT_ID"), os.getenv("MS_CLIENT_SECRET"))
     tenant_id = os.getenv("MS_TENANT_ID")
     token_backend = FileSystemTokenBackend(token_path='.', token_filename='token.json')
@@ -40,39 +40,9 @@ def init_outlook():
         print(" ATENÇÃO: AUTENTICAÇÃO INICIAL NECESSÁRIA")
         print("="*50)
         
-        # Device Code Flow
-        import msal
-        app = msal.PublicClientApplication(
-            credentials[0],
-            authority=f"https://login.microsoftonline.com/{tenant_id}"
-        )
-        
-        scopes = ["https://outlook.office.com/Mail.Read"]
-        flow = app.initiate_device_flow(scopes=scopes)
-        
-        print(f"\nFlow result: {flow}")
-        print(f"\n1. Em outro dispositivo, vá para: {flow.get('verification_uri', flow.get('verificationUrl'))}")
-        print(f"2. Digite o código: {flow.get('user_code', flow.get('code'))}")
-        print("3. Faça login com sua conta corporativa")
-        print("4. Aguarde aqui...\n")
-        
-        result = app.acquire_token_by_device_flow(flow, scopes=scopes)
-        
-        if "access_token" in result:
-            # Salva o token no formato do O365
-            import json
-            token_data = {
-                "access_token": result["access_token"],
-                "token_type": result.get("token_type", "Bearer"),
-                "expires_in": result.get("expires_in", 3600),
-                "scope": result.get("scope", ""),
-                "expires_at": int(time.time()) + result.get("expires_in", 3600)
-            }
-            token_backend.save_token(token_data)
-            print("Autenticação concluída! O arquivo token.json foi salvo.")
-        else:
-            print(f"Erro na autenticação: {result.get('error', 'Unknown')}")
-            raise Exception("Falha na autenticação")
+        # Usar o fluxo padrão do O365
+        account.authenticate(scopes=['basic', 'message_all'])
+        print("\nAutenticação concluída! O arquivo token.json foi salvo.")
         
     return account.mailbox()
 
