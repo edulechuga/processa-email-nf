@@ -47,7 +47,7 @@ def init_outlook():
             authority=f"https://login.microsoftonline.com/{tenant_id}"
         )
         
-        scopes = ["https://outlook.office.com/Mail.Read", "offline_access"]
+        scopes = ["https://outlook.office.com/Mail.Read"]
         flow = app.initiate_device_flow(scopes=scopes)
         
         print(f"\n1. Em outro dispositivo, vá para: {flow['verification_uri']}")
@@ -58,8 +58,16 @@ def init_outlook():
         result = app.acquire_token_by_device_flow(flow)
         
         if "access_token" in result:
-            # Salva o token
-            token_backend.save_token(result)
+            # Salva o token no formato do O365
+            import json
+            token_data = {
+                "access_token": result["access_token"],
+                "token_type": result.get("token_type", "Bearer"),
+                "expires_in": result.get("expires_in", 3600),
+                "scope": result.get("scope", ""),
+                "expires_at": int(time.time()) + result.get("expires_in", 3600)
+            }
+            token_backend.save_token(token_data)
             print("Autenticação concluída! O arquivo token.json foi salvo.")
         else:
             print(f"Erro na autenticação: {result.get('error', 'Unknown')}")
