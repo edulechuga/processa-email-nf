@@ -1,0 +1,14 @@
+# Email - Microsoft Graph API
+O365
+
+# PDF
+PyMuPDF
+
+# LLM
+openai
+
+# Google Sheets
+gspread
+
+# Utility
+python-dotenv
