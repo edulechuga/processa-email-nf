@@ -7,11 +7,11 @@ import zipfile
 from pathlib import Path
 from dotenv import load_dotenv
 
-# Libs do Google
+# Libs do Google (Nova Versão)
+from google import genai
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
-import google.generativeai as genai
 import gspread
 
 # Libs de Processamento
@@ -27,7 +27,7 @@ PROMPT_PATH = Path("directives/system_prompt_nf.md")
 SHEET_ID = os.getenv("GOOGLE_SHEET_ID")
 DRIVE_FOLDER_ID = os.getenv("GOOGLE_DRIVE_FOLDER_ID")
 
-# Modelo Gratuito do Google AI Studio
+# Modelo mais estável no momento
 GEMINI_MODEL_NAME = "gemini-1.5-flash" 
 SCOPES = ['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/drive']
 
@@ -41,11 +41,10 @@ def init_services():
     sheet = gc.open_by_key(SHEET_ID).sheet1
     drive_service = build('drive', 'v3', credentials=creds)
     
-    # Google AI Studio (Gemini)
-    genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
-    model = genai.GenerativeModel(GEMINI_MODEL_NAME)
+    # Novo Cliente Gemini (Google AI Studio)
+    ai_client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
     
-    return sheet, drive_service, model
+    return sheet, drive_service, ai_client
 
 def download_file_from_drive(drive_service, file_id, file_name):
     request = drive_service.files().get_media(fileId=file_id)
@@ -62,7 +61,6 @@ def split_multipage_pdf(pdf_path: Path):
     try:
         doc = fitz.open(pdf_path)
         if doc.page_count <= 1: return [pdf_path]
-        print(f"    -> Dividindo PDF '{pdf_path.name}' ({doc.page_count} pgs)...")
         for i in range(doc.page_count):
             new_doc = fitz.open()
             new_doc.insert_pdf(doc, from_page=i, to_page=i)
@@ -73,23 +71,24 @@ def split_multipage_pdf(pdf_path: Path):
         doc.close()
         pdf_path.unlink()
         return single_page_pdfs
-    except Exception as e:
-        print(f"    [ERRO PDF SPLIT] {e}")
-        return [pdf_path]
+    except: return [pdf_path]
 
 # ==========================================
 # EXTRAÇÃO DE DADOS
 # ==========================================
-def process_with_ai(model, text):
+def process_with_ai(ai_client, text):
     if not PROMPT_PATH.exists(): return None
     with open(PROMPT_PATH, "r", encoding="utf-8") as f:
         system_prompt = f.read()
     
     try:
-        # Chamada oficial para o Gemini
-        response = model.generate_content(f"{system_prompt}\n\nTEXTO DA NF:\n{text}")
+        # Nova sintaxe de chamada do Gemini
+        response = ai_client.models.generate_content(
+            model=GEMINI_MODEL_NAME,
+            contents=f"{system_prompt}\n\nTEXTO DA NF PARA EXTRAÇÃO:\n{text}"
+        )
         
-        # Limpeza de markdown de código JSON
+        # Tenta extrair o JSON da resposta
         json_match = re.search(r'\{.*\}', response.text, re.DOTALL)
         if json_match:
             return json.loads(json_match.group())
@@ -107,7 +106,7 @@ def process_with_xml(xml_path):
         infNFe = root.find('.//infNFe')
         if infNFe is None: return None
         
-        # Mapeamento fixo do XML para JSON (Exatamente como o anterior)
+        # Mapeamento fixo
         dados_json = {
             "Dados da NF": {
                 "Data": infNFe.findtext('.//ide/dhEmi', '')[:10],
@@ -147,25 +146,25 @@ def process_with_xml(xml_path):
 # ==========================================
 # PIPELINE DE EXECUÇÃO
 # ==========================================
-def run_pipeline(drive_service, model, sheet):
+def run_pipeline(drive_service, ai_client, sheet):
+    # Limpa temporários locais
     for item in TMP_DIR.glob('*'): item.unlink()
 
     query = f"'{DRIVE_FOLDER_ID}' in parents and trashed = false"
     results = drive_service.files().list(q=query, fields="files(id, name)", supportsAllDrives=True, includeItemsFromAllDrives=True).execute()
     drive_files = results.get('files', [])
     
-    print(f"[{time.strftime('%H:%M:%S')}] Vasculhando pasta... {len(drive_files)} arquivos encontrados.")
     if not drive_files: return
+    print(f"[{time.strftime('%H:%M:%S')}] {len(drive_files)} arquivos encontrados.")
 
     drive_file_map = {} 
     drive_ids_to_delete = set()
     processed_nf_numbers = set()
 
-    # --- FASE 1: TRIAGEM E ZIP ---
+    # --- FASE 1: ZIP E TRIAGEM ---
     for f in drive_files:
         name_lower = f['name'].lower()
         if not name_lower.endswith(('.pdf', '.xml', '.zip')):
-            print(f"    [LIXO] '{f['name']}' removido.")
             drive_ids_to_delete.add(f['id'])
             continue
 
@@ -175,10 +174,11 @@ def run_pipeline(drive_service, model, sheet):
                 zip_path = download_file_from_drive(drive_service, f['id'], f['name'])
                 with zipfile.ZipFile(zip_path, 'r') as z: z.extractall(TMP_DIR)
                 zip_path.unlink()
-                drive_ids_to_delete.add(f['id'])
+                # Deleta o ZIP do drive imediatamente após extrair para evitar loop
+                drive_service.files().delete(fileId=f['id']).execute()
             except Exception as e: print(f"    [ERRO ZIP] {e}")
 
-    # Baixa PDFs e XMLs
+    # Baixa arquivos PDF e XML (incluindo os que vieram do ZIP)
     for f in drive_files:
         if f['name'].lower().endswith(('.pdf', '.xml')):
             try:
@@ -186,63 +186,61 @@ def run_pipeline(drive_service, model, sheet):
                 if local_path.suffix.lower() == '.pdf':
                     for spdf in split_multipage_pdf(local_path): drive_file_map[spdf] = f['id']
                 else: drive_file_map[local_path] = f['id']
-            except Exception as e: print(f"    [ERRO DOWNLOAD] {f['name']}: {e}")
+            except: pass
 
-    # --- FASE 2: XML (Verdade) ---
+    # --- FASE 2: XML ---
     for xml_path in TMP_DIR.glob('*.xml'):
         dados = process_with_xml(xml_path)
         if dados:
             nf_num = dados.get("Dados da NF", {}).get("Número da NF")
             if nf_num:
-                # Lógica de linha para o Google Sheets (Exatamente como o anterior)
                 d_nf=dados.get("Dados da NF",{}); dest=dados.get("Campos do destinatário",{}); fat=dados.get("Faturas",[]); transp=dados.get("Transportador",{}); prod=dados.get("Produtos",[]); adic=dados.get("Dados adicionais",{})
                 fat1=fat[0] if fat else {}; fat2=fat[1] if len(fat)>1 else {}; p1=prod[0] if prod else {}
                 row=[d_nf.get("Data",""),d_nf.get("Número da NF",""),d_nf.get("Chave de Acesso da NF-E",""),d_nf.get("Natureza da operação",""),dest.get("Nome/Razao Social",""),dest.get("CNPJ/CPF",""),dest.get("Endereço",""),dest.get("Bairro/Distrito",""),dest.get("CEP",""),dest.get("Municipio",""),dest.get("UF",""),dest.get("Inscrição Estadual",""),fat1.get("Data de vencimento",""),fat1.get("Valor",""),fat2.get("Data de vencimento",""),fat2.get("Valor",""),dados.get("Valor total da Nota Fiscal",""),transp.get("Razao Social",""),transp.get("Quantidade",""),transp.get("Especie",""),p1.get("Cod. Produto",""),p1.get("Descrição do prod/serv.",""),p1.get("NCM",""),p1.get("CST",""),p1.get("CFOP",""),p1.get("UN",""),p1.get("QUANT",""),p1.get("V. UNITARIO",""),p1.get("V. TOTAL",""),p1.get("BC ICMS",""),p1.get("V ICMS",""),p1.get("V IPI",""),p1.get("A ICMS",""),p1.get("A IPI",""),adic.get("Informações complementares","")]
                 sheet.append_row(row)
-                print(f"    [XML SUCESSO] NF '{nf_num}' salva.")
+                print(f"    [XML] NF '{nf_num}' salva.")
                 processed_nf_numbers.add(nf_num)
-                drive_ids_to_delete.add(drive_file_map.get(xml_path))
+                if xml_path in drive_file_map: drive_ids_to_delete.add(drive_file_map[xml_path])
 
-    # --- FASE 3: PDF (IA) ---
+    # --- FASE 3: PDF ---
     for pdf_path in TMP_DIR.glob('*.pdf'):
-        text = fitz.open(pdf_path)[0].get_text() # Pega texto da página única
-        dados = process_with_ai(model, text)
-        if dados:
-            nf_num = dados.get("Dados da NF", {}).get("Número da NF")
-            if nf_num and nf_num in processed_nf_numbers:
-                print(f"    [IGNORADO] PDF '{pdf_path.name}' duplicata da NF '{nf_num}'.")
-                drive_ids_to_delete.add(drive_file_map.get(pdf_path))
-            elif nf_num:
-                # Mesma lógica de row para Sheets
-                d_nf=dados.get("Dados da NF",{}); dest=dados.get("Campos do destinatário",{}); fat=dados.get("Faturas",[]); transp=dados.get("Transportador",{}); prod=dados.get("Produtos",[]); adic=dados.get("Dados adicionais",{})
-                fat1=fat[0] if fat else {}; fat2=fat[1] if len(fat)>1 else {}; p1=prod[0] if prod else {}
-                row=[d_nf.get("Data",""),d_nf.get("Número da NF",""),d_nf.get("Chave de Acesso da NF-E",""),d_nf.get("Natureza da operação",""),dest.get("Nome/Razao Social",""),dest.get("CNPJ/CPF",""),dest.get("Endereço",""),dest.get("Bairro/Distrito",""),dest.get("CEP",""),dest.get("Municipio",""),dest.get("UF",""),dest.get("Inscrição Estadual",""),fat1.get("Data de vencimento",""),fat1.get("Valor",""),fat2.get("Data de vencimento",""),fat2.get("Valor",""),dados.get("Valor total da Nota Fiscal",""),transp.get("Razao Social",""),transp.get("Quantidade",""),transp.get("Especie",""),p1.get("Cod. Produto",""),p1.get("Descrição do prod/serv.",""),p1.get("NCM",""),p1.get("CST",""),p1.get("CFOP",""),p1.get("UN",""),p1.get("QUANT",""),p1.get("V. UNITARIO",""),p1.get("V. TOTAL",""),p1.get("BC ICMS",""),p1.get("V ICMS",""),p1.get("V IPI",""),p1.get("A ICMS",""),p1.get("A IPI",""),adic.get("Informações complementares","")]
-                sheet.append_row(row)
-                print(f"    [PDF SUCESSO] NF '{nf_num}' salva via Gemini.")
-                processed_nf_numbers.add(nf_num)
-                drive_ids_to_delete.add(drive_file_map.get(pdf_path))
+        try:
+            doc = fitz.open(pdf_path)
+            text = doc[0].get_text()
+            doc.close()
+            
+            dados = process_with_ai(ai_client, text)
+            if dados:
+                nf_num = dados.get("Dados da NF", {}).get("Número da NF")
+                if nf_num and nf_num in processed_nf_numbers:
+                    drive_ids_to_delete.add(drive_file_map.get(pdf_path))
+                elif nf_num:
+                    d_nf=dados.get("Dados da NF",{}); dest=dados.get("Campos do destinatário",{}); fat=dados.get("Faturas",[]); transp=dados.get("Transportador",{}); prod=dados.get("Produtos",[]); adic=dados.get("Dados adicionais",{})
+                    fat1=fat[0] if fat else {}; fat2=fat[1] if len(fat)>1 else {}; p1=prod[0] if prod else {}
+                    row=[d_nf.get("Data",""),d_nf.get("Número da NF",""),d_nf.get("Chave de Acesso da NF-E",""),d_nf.get("Natureza da operação",""),dest.get("Nome/Razao Social",""),dest.get("CNPJ/CPF",""),dest.get("Endereço",""),dest.get("Bairro/Distrito",""),dest.get("CEP",""),dest.get("Municipio",""),dest.get("UF",""),dest.get("Inscrição Estadual",""),fat1.get("Data de vencimento",""),fat1.get("Valor",""),fat2.get("Data de vencimento",""),fat2.get("Valor",""),dados.get("Valor total da Nota Fiscal",""),transp.get("Razao Social",""),transp.get("Quantidade",""),transp.get("Especie",""),p1.get("Cod. Produto",""),p1.get("Descrição do prod/serv.",""),p1.get("NCM",""),p1.get("CST",""),p1.get("CFOP",""),p1.get("UN",""),p1.get("QUANT",""),p1.get("V. UNITARIO",""),p1.get("V. TOTAL",""),p1.get("BC ICMS",""),p1.get("V ICMS",""),p1.get("V IPI",""),p1.get("A ICMS",""),p1.get("A IPI",""),adic.get("Informações complementares","")]
+                    sheet.append_row(row)
+                    print(f"    [PDF] NF '{nf_num}' salva.")
+                    if pdf_path in drive_file_map: drive_ids_to_delete.add(drive_file_map[pdf_path])
+        except Exception as e: print(f"    [ERRO PDF] {e}")
 
     # --- FASE 4: LIMPEZA ---
-    if drive_ids_to_delete:
-        print(f"  -> Limpando {len(drive_ids_to_delete)} arquivos do Drive...")
-        for d_id in drive_ids_to_delete:
-            if d_id:
-                try: drive_service.files().delete(fileId=d_id).execute()
-                except: pass
+    for d_id in drive_ids_to_delete:
+        if d_id:
+            try: drive_service.files().delete(fileId=d_id).execute()
+            except: pass
 
 # ==========================================
 # LOOP PRINCIPAL
 # ==========================================
 def main():
-    print("Conectando ao Google e Gemini Gratuito...")
+    print("Conectando ao Google e Gemini (Novo SDK)...")
     try:
-        sheet, drive_service, model = init_services()
-        print("\nMonitoramento iniciado (Loop 15s). Pressione Ctrl+C para parar.\n")
+        sheet, drive_service, ai_client = init_services()
+        print("\nMonitoramento iniciado (15s). Pressione Ctrl+C para parar.\n")
         while True:
-            try: run_pipeline(drive_service, model, sheet)
-            except Exception as e: print(f"[{time.strftime('%H:%M:%S')}] Erro: {e}")
+            try: run_pipeline(drive_service, ai_client, sheet)
+            except Exception as e: print(f"Erro: {e}")
             time.sleep(15)
-    except Exception as e:
-        print(f"FALHA NA INICIALIZAÇÃO: {e}")
+    except Exception as e: print(f"FALHA INICIAL: {e}")
 
 if __name__ == "__main__": main()
