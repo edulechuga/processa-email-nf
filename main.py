@@ -30,23 +30,39 @@ LLM_MODEL = "google/gemini-2.5-flash"
 # FUNÇÕES DE INICIALIZAÇÃO
 # ==========================================
 def init_outlook():
-    """Conecta ao Microsoft Graph API usando fluxo de autenticação."""
+    """Conecta ao Microsoft Graph API usando o Refresh Token herdado do N8N."""
     credentials = (os.getenv("MS_CLIENT_ID"), os.getenv("MS_CLIENT_SECRET"))
     tenant_id = os.getenv("MS_TENANT_ID")
+    
     token_backend = FileSystemTokenBackend(token_path='.', token_filename='token.json')
     account = Account(credentials, tenant_id=tenant_id, token_backend=token_backend)
     
-    if not account.is_authenticated:
-        print("\n" + "="*50)
-        print(" ATENÇÃO: AUTENTICAÇÃO INICIAL NECESSÁRIA")
-        print("="*50)
-        print("1. Copie o link abaixo.")
-        print("2. Cole no navegador e faça login.")
-        print("3. Aceite as permissões.")
-        print("4. Cole a URL final aqui.\n")
-        account.authenticate(scopes=['basic', 'message_all'])
-        print("\nAutenticação concluída!")
+    # O método is_authenticated pode falhar se o token já estiver expirado
+    # Vamos tentar uma abordagem mais robusta
+    try:
+        # Tenta carregar o token do backend
+        token_data = token_backend.load_token()
         
+        # Se não conseguiu carregar, ou se o token expirou, tenta refresh
+        if not token_data or token_data.get('expires_at', 0) < time.time():
+            print("[Auth] Token expirado ou não encontrado. Tentando renovar com Refresh Token...")
+            
+            # Força refresh
+            if account.con.refresh_token():
+                print("[Auth] Token renovado com sucesso!")
+            else:
+                raise Exception("FALHA: Não foi possível renovar o token")
+                
+    except ValueError as e:
+        # O O365 pode lançar ValueError se o token for inválido
+        print(f"[Auth] Token inválido detectedo: {e}")
+        print("[Auth] Tentando renovar com Refresh Token...")
+        
+        if account.con.refresh_token():
+            print("[Auth] Token renovado com sucesso!")
+        else:
+            raise Exception("FALHA: Não foi possível renovar o token")
+            
     return account.mailbox()
 
 def init_openrouter():
