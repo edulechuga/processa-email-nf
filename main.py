@@ -6,6 +6,7 @@ import logging
 import xml.etree.ElementTree as ET
 import zipfile
 from pathlib import Path
+from datetime import datetime, timedelta, timezone
 from dotenv import load_dotenv
 
 # Libs do Google
@@ -32,12 +33,13 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ==========================================
-# CONFIGURAÇÕES INICIAIS E MEMÓRIA
+# CONFIGURAÇÕES INICIAIS
 # ==========================================
 load_dotenv()
 TMP_DIR = Path(".tmp")
 TMP_DIR.mkdir(exist_ok=True)
-DB_PATH = Path("processados.ndjson") # BANCO DE MEMÓRIA
+DB_PATH = Path("processados.ndjson") 
+LAST_CLEANUP_FILE = Path(".last_cleanup") # Para lembrar quando limpou a pasta
 
 PROMPT_PATH = Path("directives/system_prompt_nf.md")
 SHEET_ID = os.getenv("GOOGLE_SHEET_ID")
@@ -57,7 +59,54 @@ def save_processed_id(file_id):
         f.write(f"{file_id}\n")
 
 # ==========================================
-# INICIALIZAÇÃO E UTILITÁRIOS DRIVE
+# FUNÇÃO DE LIMPEZA AUTOMÁTICA (Nova!)
+# ==========================================
+def cleanup_old_files(drive_service):
+    """Apaga arquivos da pasta Processados que tenham mais de 10 dias. Executa 1x ao dia."""
+    now = time.time()
+    
+    # Verifica se o arquivo de controle existe e se a última limpeza foi há menos de 24 horas
+    if LAST_CLEANUP_FILE.exists():
+        last_cleanup_time = LAST_CLEANUP_FILE.stat().st_mtime
+        if (now - last_cleanup_time) < 86400: # 86400s = 24h
+            # Ainda não deu 24h desde a última faxina, pula silenciosamente
+            return
+
+    logger.info("🕒 Hora da faxina diária! Verificando arquivos com mais de 10 dias na pasta 'Processados'...")
+    
+    # Define a data de corte (10 dias atrás)
+    cutoff_date = datetime.now(timezone.utc) - timedelta(days=10)
+    format_date = cutoff_date.isoformat().replace('+00:00', 'Z')
+    
+    query = f"'{ARCHIVE_FOLDER_ID}' in parents and createdTime < '{format_date}' and trashed = false"
+    
+    try:
+        results = drive_service.files().list(
+            q=query, 
+            fields="files(id, name, createdTime)",
+            supportsAllDrives=True
+        ).execute()
+        files_to_delete = results.get('files', [])
+
+        if not files_to_delete:
+            logger.info("Nenhum arquivo antigo encontrado para remoção.")
+        else:
+            for f in files_to_delete:
+                try:
+                    drive_service.files().delete(fileId=f['id']).execute()
+                    logger.info(f"🗑️ Faxina: Arquivo '{f['name']}' (ID: {f['id']}) apagado permanentemente.")
+                except Exception as e:
+                    logger.error(f"Erro ao apagar arquivo na faxina: {e}")
+        
+        # Atualiza a data de modificação do arquivo para marcar que a limpeza foi feita agora
+        LAST_CLEANUP_FILE.touch()
+        logger.info(f"✅ Faxina diária concluída. Próxima limpeza em 24 horas.")
+        
+    except Exception as e:
+        logger.error(f"Erro ao acessar o Drive para faxina: {e}")
+
+# ==========================================
+# UTILITÁRIOS DRIVE E SERVIÇOS
 # ==========================================
 def init_services():
     try:
@@ -66,7 +115,6 @@ def init_services():
         sheet = gc.open_by_key(SHEET_ID).sheet1
         drive_service = build('drive', 'v3', credentials=creds)
         ai_client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
-        logger.info("Conexões estabelecidas.")
         return sheet, drive_service, ai_client
     except Exception as e:
         logger.error(f"Erro inicialização: {e}")
@@ -79,35 +127,29 @@ def download_file_from_drive(drive_service, file_id, file_name):
         with open(file_path, 'wb') as fh:
             downloader = MediaIoBaseDownload(fh, request)
             done = False
-            while not done:
-                status, done = downloader.next_chunk()
+            while not done: status, done = downloader.next_chunk()
         return file_path
     except Exception as e:
         logger.error(f"Erro download {file_name}: {e}")
         return None
 
 def archive_file(drive_service, file_id, file_name):
-    """Tenta mover o arquivo para a pasta Processados. Se falhar, não trava o sistema."""
     try:
-        # Pega a lista de pastas pai atuais
         file = drive_service.files().get(fileId=file_id, fields='parents').execute()
         previous_parents = ",".join(file.get('parents'))
-        
-        # Move o arquivo para a pasta de arquivos processados
         drive_service.files().update(
             fileId=file_id,
             addParents=ARCHIVE_FOLDER_ID,
             removeParents=previous_parents,
             fields='id, parents'
         ).execute()
-        logger.info(f"Arquivo '{file_name}' arquivado na pasta Processados.")
+        logger.info(f"Arquivo '{file_name}' movido para Processados.")
     except Exception as e:
-        logger.warning(f"Não foi possível mover '{file_name}' para pasta Processados (Provavelmente erro 403). O arquivo continuará na pasta de entrada, mas a memória impedirá o reprocessamento. Erro: {e}")
+        logger.warning(f"Não foi possível mover '{file_name}'. Memória local evitará reprocessamento.")
 
 # ==========================================
 # EXTRAÇÃO E MAPEAMENTO
 # ==========================================
-# (As funções process_with_ai, process_with_xml e map_to_row continuam iguais à versão anterior)
 def process_with_ai(ai_client, text):
     if not PROMPT_PATH.exists(): return None
     with open(PROMPT_PATH, "r", encoding="utf-8") as f:
@@ -164,7 +206,7 @@ def process_with_xml(xml_path):
         return dados_json
     except: return None
 
-def map_to_row(dados_json):
+def map_to_row(dados_json, source_type):
     d = dados_json.get("Dados da NF", {}); de = dados_json.get("Campos do destinatário", {}); faturas = dados_json.get("Faturas", []); t = dados_json.get("Transportador", {}); p = dados_json.get("Produtos", [{}]); a = dados_json.get("Dados adicionais", {})
     f_row = []
     for i in range(8):
@@ -173,49 +215,44 @@ def map_to_row(dados_json):
     p1 = p[0] if len(p) > 0 else {}
     row = [d.get("Data", ""), d.get("Número da NF", ""), d.get("Chave de Acesso da NF-E", ""), d.get("Natureza da operação", ""), de.get("Nome/Razao Social", ""), de.get("CNPJ/CPF", ""), de.get("Endereço", ""), de.get("Bairro/Distrito", ""), de.get("CEP", ""), de.get("Municipio", ""), de.get("UF", ""), de.get("Inscrição Estadual", "")]
     row.extend(f_row)
-    row.extend([dados_json.get("Valor total da Nota Fiscal", ""), t.get("Razao Social", ""), t.get("Quantidade", ""), t.get("Especie", ""), p1.get("Cod. Produto", ""), p1.get("Descrição do prod/serv.", ""), p1.get("NCM", ""), p1.get("CST", ""), p1.get("CFOP", ""), p1.get("UN", ""), p1.get("QUANT", ""), p1.get("V. UNITARIO", ""), p1.get("V. TOTAL", ""), p1.get("BC ICMS", ""), p1.get("V ICMS", ""), p1.get("V IPI", ""), p1.get("A ICMS", ""), p1.get("A IPI", ""), a.get("Informações complementares", "")])
+    row.extend([dados_json.get("Valor total da Nota Fiscal", ""), t.get("Razao Social", ""), t.get("Quantidade", ""), t.get("Especie", ""), p1.get("Cod. Produto", ""), p1.get("Descrição do prod/serv.", ""), p1.get("NCM", ""), p1.get("CST", ""), p1.get("CFOP", ""), p1.get("UN", ""), p1.get("QUANT", ""), p1.get("V. UNITARIO", ""), p1.get("V. TOTAL", ""), p1.get("BC ICMS", ""), p1.get("V ICMS", ""), p1.get("V IPI", ""), p1.get("A ICMS", ""), p1.get("A IPI", ""), a.get("Informações complementares", ""), source_type])
     return row
 
 # ==========================================
 # PIPELINE
 # ==========================================
 def run_pipeline(drive_service, ai_client, sheet):
+    # 0. Faxina preventiva (Limpa pasta local e depois verifica arquivos antigos no Drive)
     for item in TMP_DIR.glob('*'): item.unlink()
+    cleanup_old_files(drive_service)
+    
     processed_ids = load_processed_ids()
-
     query = f"'{DRIVE_FOLDER_ID}' in parents and trashed = false"
     results = drive_service.files().list(q=query, fields="files(id, name)", supportsAllDrives=True, includeItemsFromAllDrives=True).execute()
     drive_files = results.get('files', [])
     
     if not drive_files: return
-    logger.info(f"Ciclo: {len(drive_files)} arquivos encontrados.")
+    logger.info(f"Ciclo: {len(drive_files)} arquivos encontrados na entrada.")
     
     drive_file_map = {} 
     processed_nf_numbers = set()
 
     for f in drive_files:
         name, fid = f['name'], f['id']
-        
-        # 1. Checa memória para evitar looping
-        if fid in processed_ids:
-            continue
-
+        if fid in processed_ids: continue
         if not name.lower().endswith(('.pdf', '.xml', '.zip')):
-            save_processed_id(fid) # Marca como feito para não olhar de novo
+            save_processed_id(fid)
             archive_file(drive_service, fid, name)
             continue
-
         if name.lower().endswith('.zip'):
-            logger.info(f"Trabalhando no ZIP: {name}")
             local_zip = download_file_from_drive(drive_service, fid, name)
             if local_zip:
                 try:
                     with zipfile.ZipFile(local_zip, 'r') as z: z.extractall(TMP_DIR)
-                    save_processed_id(fid) # MEMÓRIA ATUALIZADA
+                    save_processed_id(fid)
                     archive_file(drive_service, fid, name)
                 except: logger.error(f"Erro ZIP {name}")
 
-    # Baixa individuais não processados
     for f in drive_files:
         if f['name'].lower().endswith(('.pdf', '.xml')) and f['id'] not in processed_ids:
             path = download_file_from_drive(drive_service, f['id'], f['name'])
@@ -226,8 +263,8 @@ def run_pipeline(drive_service, ai_client, sheet):
         dados = process_with_xml(xml_path)
         if dados:
             nf = dados.get("Dados da NF", {}).get("Número da NF")
-            sheet.append_row(map_to_row(dados))
-            logger.info(f"XML SUCESSO: NF {nf}")
+            sheet.append_row(map_to_row(dados, "XML (Determinístico)"))
+            logger.info(f"SUCESSO XML: NF {nf}")
             processed_nf_numbers.add(nf)
             fid = drive_file_map.get(xml_path)
             if fid:
@@ -242,11 +279,9 @@ def run_pipeline(drive_service, ai_client, sheet):
                 dados = process_with_ai(ai_client, page.get_text())
                 if dados:
                     nf = dados.get("Dados da NF", {}).get("Número da NF")
-                    if nf in processed_nf_numbers:
-                        logger.info(f"PDF NF {nf} duplicado.")
-                    else:
-                        sheet.append_row(map_to_row(dados))
-                        logger.info(f"PDF SUCESSO: NF {nf}")
+                    if nf not in processed_nf_numbers:
+                        sheet.append_row(map_to_row(dados, "PDF (IA Gemini)"))
+                        logger.info(f"SUCESSO IA: NF {nf}")
                         processed_nf_numbers.add(nf)
             doc.close()
             fid = drive_file_map.get(pdf_path)
@@ -256,13 +291,14 @@ def run_pipeline(drive_service, ai_client, sheet):
         except Exception as e: logger.error(f"Erro PDF {pdf_path}: {e}")
 
 def main():
-    logger.info("Serviço Iniciado com Banco de Memória.")
+    logger.info("Iniciando Robô com Auto-Limpeza de 10 dias.")
     try:
         sheet, drive_service, ai_client = init_services()
         while True:
             try: run_pipeline(drive_service, ai_client, sheet)
             except Exception as e: logger.error(f"Erro ciclo: {e}")
             time.sleep(15)
+    except KeyboardInterrupt: logger.info("Encerrado.")
     except Exception as e: logger.critical(f"Erro fatal: {e}")
 
 if __name__ == "__main__": main()
