@@ -31,38 +31,57 @@ LLM_MODEL = "google/gemini-2.5-flash"
 # ==========================================
 def init_outlook():
     """Conecta ao Microsoft Graph API usando o Refresh Token herdado do N8N."""
-    credentials = (os.getenv("MS_CLIENT_ID"), os.getenv("MS_CLIENT_SECRET"))
+    import requests
+    
+    client_id = os.getenv("MS_CLIENT_ID")
+    client_secret = os.getenv("MS_CLIENT_SECRET")
     tenant_id = os.getenv("MS_TENANT_ID")
     
-    token_backend = FileSystemTokenBackend(token_path='.', token_filename='token.json')
-    account = Account(credentials, tenant_id=tenant_id, token_backend=token_backend)
+    # Lê o refresh_token do arquivo token.json
+    token_file = Path("token.json")
+    if not token_file.exists():
+        raise Exception("token.json não encontrado")
     
-    # O método is_authenticated pode falhar se o token já estiver expirado
-    # Vamos tentar uma abordagem mais robusta
-    try:
-        # Tenta carregar o token do backend
-        token_data = token_backend.load_token()
-        
-        # Se não conseguiu carregar, ou se o token expirou, tenta refresh
-        if not token_data or token_data.get('expires_at', 0) < time.time():
-            print("[Auth] Token expirado ou não encontrado. Tentando renovar com Refresh Token...")
-            
-            # Força refresh
-            if account.con.refresh_token():
-                print("[Auth] Token renovado com sucesso!")
-            else:
-                raise Exception("FALHA: Não foi possível renovar o token")
-                
-    except ValueError as e:
-        # O O365 pode lançar ValueError se o token for inválido
-        print(f"[Auth] Token inválido detectedo: {e}")
-        print("[Auth] Tentando renovar com Refresh Token...")
-        
-        if account.con.refresh_token():
-            print("[Auth] Token renovado com sucesso!")
-        else:
-            raise Exception("FALHA: Não foi possível renovar o token")
-            
+    with open(token_file, 'r') as f:
+        token_data = json.load(f)
+    
+    refresh_token = token_data.get('refresh_token')
+    if not refresh_token:
+        raise Exception("Refresh token não encontrado no token.json")
+    
+    # Faz refresh manualmente via API
+    print("[Auth] Tentando renovar o token com Refresh Token...")
+    
+    token_url = f"https://login.microsoftonline.com/{tenant_id}/oauth2/v2.0/token"
+    
+    data = {
+        "grant_type": "refresh_token",
+        "client_id": client_id,
+        "client_secret": client_secret,
+        "refresh_token": refresh_token,
+        "scope": "https://outlook.office.com/Mail.Read offline_access"
+    }
+    
+    response = requests.post(token_url, data=data)
+    
+    if response.status_code != 200:
+        print(f"[Auth] Erro ao renovar token: {response.status_code}")
+        print(f"[Auth] Response: {response.text}")
+        raise Exception("FALHA: Não foi possível renovar o token")
+    
+    # Salva o novo token
+    new_token = response.json()
+    new_token['expires_at'] = int(time.time()) + new_token.get('expires_in', 3600)
+    
+    with open(token_file, 'w') as f:
+        json.dump(new_token, f)
+    
+    print("[Auth] Token renovado com sucesso!")
+    
+    # Agora cria o Account com o token válido
+    token_backend = FileSystemTokenBackend(token_path='.', token_filename='token.json')
+    account = Account((client_id, client_secret), tenant_id=tenant_id, token_backend=token_backend)
+    
     return account.mailbox()
 
 def init_openrouter():
