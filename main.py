@@ -33,13 +33,14 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ==========================================
-# CONFIGURAÇÕES INICIAIS
+# CONFIGURAÇÕES INICIAIS E MEMÓRIA
 # ==========================================
 load_dotenv()
 TMP_DIR = Path(".tmp")
 TMP_DIR.mkdir(exist_ok=True)
-DB_PATH = Path("processados.ndjson") 
-LAST_CLEANUP_FILE = Path(".last_cleanup") # Para lembrar quando limpou a pasta
+ID_DB_PATH = Path("processados_ids.ndjson")     # Memória Técnica (ID do Drive)
+NF_DB_PATH = Path("nfs_processadas.txt")        # Memória de Negócio (Número da NF)
+LAST_CLEANUP_FILE = Path(".last_cleanup")
 
 PROMPT_PATH = Path("directives/system_prompt_nf.md")
 SHEET_ID = os.getenv("GOOGLE_SHEET_ID")
@@ -49,256 +50,170 @@ GEMINI_MODEL_ID = "gemini-2.5-flash"
 
 SCOPES = ['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/drive']
 
-def load_processed_ids():
-    if not DB_PATH.exists(): return set()
-    with open(DB_PATH, "r") as f:
-        return set(line.strip() for line in f if line.strip())
+# --- GESTÃO DE MEMÓRIA ---
+def load_memories():
+    ids = set()
+    if ID_DB_PATH.exists():
+        ids = set(line.strip() for line in ID_DB_PATH.read_text().splitlines() if line.strip())
+    
+    nfs = set()
+    if NF_DB_PATH.exists():
+        nfs = set(line.strip() for line in NF_DB_PATH.read_text().splitlines() if line.strip())
+    
+    return ids, nfs
 
-def save_processed_id(file_id):
-    with open(DB_PATH, "a") as f:
-        f.write(f"{file_id}\n")
+def save_id_memory(file_id):
+    with open(ID_DB_PATH, "a") as f: f.write(f"{file_id}\n")
+
+def save_nf_memory(nf_number):
+    with open(NF_DB_PATH, "a") as f: f.write(f"{nf_number}\n")
 
 # ==========================================
-# FUNÇÃO DE LIMPEZA AUTOMÁTICA (Nova!)
+# UTILITÁRIOS E FAXINA
 # ==========================================
 def cleanup_old_files(drive_service):
-    """Apaga arquivos da pasta Processados que tenham mais de 10 dias. Executa 1x ao dia."""
     now = time.time()
-    
-    # Verifica se o arquivo de controle existe e se a última limpeza foi há menos de 24 horas
-    if LAST_CLEANUP_FILE.exists():
-        last_cleanup_time = LAST_CLEANUP_FILE.stat().st_mtime
-        if (now - last_cleanup_time) < 86400: # 86400s = 24h
-            # Ainda não deu 24h desde a última faxina, pula silenciosamente
-            return
-
-    logger.info("🕒 Hora da faxina diária! Verificando arquivos com mais de 10 dias na pasta 'Processados'...")
-    
-    # Define a data de corte (10 dias atrás)
+    if LAST_CLEANUP_FILE.exists() and (now - LAST_CLEANUP_FILE.stat().st_mtime) < 86400:
+        return
+    logger.info("🕒 Iniciando faxina diária na pasta Processados...")
     cutoff_date = datetime.now(timezone.utc) - timedelta(days=10)
     format_date = cutoff_date.isoformat().replace('+00:00', 'Z')
-    
     query = f"'{ARCHIVE_FOLDER_ID}' in parents and createdTime < '{format_date}' and trashed = false"
-    
     try:
-        results = drive_service.files().list(
-            q=query, 
-            fields="files(id, name, createdTime)",
-            supportsAllDrives=True
-        ).execute()
-        files_to_delete = results.get('files', [])
-
-        if not files_to_delete:
-            logger.info("Nenhum arquivo antigo encontrado para remoção.")
-        else:
-            for f in files_to_delete:
-                try:
-                    drive_service.files().delete(fileId=f['id']).execute()
-                    logger.info(f"🗑️ Faxina: Arquivo '{f['name']}' (ID: {f['id']}) apagado permanentemente.")
-                except Exception as e:
-                    logger.error(f"Erro ao apagar arquivo na faxina: {e}")
-        
-        # Atualiza a data de modificação do arquivo para marcar que a limpeza foi feita agora
+        results = drive_service.files().list(q=query, fields="files(id, name)", supportsAllDrives=True).execute()
+        for f in results.get('files', []):
+            drive_service.files().delete(fileId=f['id']).execute()
+            logger.info(f"🗑️ Faxina: '{f['name']}' removido.")
         LAST_CLEANUP_FILE.touch()
-        logger.info(f"✅ Faxina diária concluída. Próxima limpeza em 24 horas.")
-        
-    except Exception as e:
-        logger.error(f"Erro ao acessar o Drive para faxina: {e}")
-
-# ==========================================
-# UTILITÁRIOS DRIVE E SERVIÇOS
-# ==========================================
-def init_services():
-    try:
-        creds = Credentials.from_service_account_file('credentials.json', scopes=SCOPES)
-        gc = gspread.authorize(creds)
-        sheet = gc.open_by_key(SHEET_ID).sheet1
-        drive_service = build('drive', 'v3', credentials=creds)
-        ai_client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
-        return sheet, drive_service, ai_client
-    except Exception as e:
-        logger.error(f"Erro inicialização: {e}")
-        raise
-
-def download_file_from_drive(drive_service, file_id, file_name):
-    request = drive_service.files().get_media(fileId=file_id)
-    file_path = TMP_DIR / file_name
-    try:
-        with open(file_path, 'wb') as fh:
-            downloader = MediaIoBaseDownload(fh, request)
-            done = False
-            while not done: status, done = downloader.next_chunk()
-        return file_path
-    except Exception as e:
-        logger.error(f"Erro download {file_name}: {e}")
-        return None
+    except Exception as e: logger.error(f"Erro na faxina: {e}")
 
 def archive_file(drive_service, file_id, file_name):
     try:
         file = drive_service.files().get(fileId=file_id, fields='parents').execute()
-        previous_parents = ",".join(file.get('parents'))
-        drive_service.files().update(
-            fileId=file_id,
-            addParents=ARCHIVE_FOLDER_ID,
-            removeParents=previous_parents,
-            fields='id, parents'
-        ).execute()
-        logger.info(f"Arquivo '{file_name}' movido para Processados.")
-    except Exception as e:
-        logger.warning(f"Não foi possível mover '{file_name}'. Memória local evitará reprocessamento.")
+        prev = ",".join(file.get('parents'))
+        drive_service.files().update(fileId=file_id, addParents=ARCHIVE_FOLDER_ID, removeParents=prev).execute()
+        logger.info(f"📁 Arquivo '{file_name}' movido para Processados.")
+    except: logger.warning(f"⚠️ Não foi possível mover '{file_name}', mas a memória impedirá duplicidade.")
 
 # ==========================================
-# EXTRAÇÃO E MAPEAMENTO
+# EXTRAÇÃO
 # ==========================================
 def process_with_ai(ai_client, text):
-    if not PROMPT_PATH.exists(): return None
-    with open(PROMPT_PATH, "r", encoding="utf-8") as f:
-        system_prompt = f.read()
+    with open(PROMPT_PATH, "r", encoding="utf-8") as f: prompt = f.read()
     try:
-        response = ai_client.models.generate_content(model=GEMINI_MODEL_ID, contents=f"{system_prompt}\n\nTEXTO NF:\n{text}")
-        json_match = re.search(r'\{.*\}', response.text, re.DOTALL)
-        return json.loads(json_match.group()) if json_match else None
+        resp = ai_client.models.generate_content(model=GEMINI_MODEL_ID, contents=f"{prompt}\n\nTEXTO NF:\n{text}")
+        match = re.search(r'\{.*\}', resp.text, re.DOTALL)
+        return json.loads(match.group()) if match else None
     except: return None
 
 def process_with_xml(xml_path):
     try:
-        with open(xml_path, 'r', encoding='utf-8', errors='ignore') as f:
-            xml_content = f.read()
-        xml_content = re.sub(r'\sxmlns="[^"]+"', '', xml_content, count=1)
-        root = ET.fromstring(xml_content)
-        infNFe = root.find('.//infNFe')
-        if infNFe is None: return None
-        dados_json = {
-            "Dados da NF": {
-                "Data": infNFe.findtext('.//ide/dhEmi', '')[:10],
-                "Número da NF": infNFe.findtext('.//ide/nNF', ''),
-                "Chave de Acesso da NF-E": infNFe.get('Id', '').replace('NFe', ''),
-                "Natureza da operação": infNFe.findtext('.//ide/natOp', '')
-            },
-            "Campos do destinatário": {
-                "Nome/Razao Social": infNFe.findtext('.//dest/xNome', ''),
-                "CNPJ/CPF": infNFe.findtext('.//dest/CNPJ', '') or infNFe.findtext('.//dest/CPF', ''),
-                "Endereço": infNFe.findtext('.//dest/enderDest/xLgr', ''),
-                "Bairro/Distrito": infNFe.findtext('.//dest/enderDest/xBairro', ''),
-                "CEP": infNFe.findtext('.//dest/enderDest/CEP', ''),
-                "Municipio": infNFe.findtext('.//dest/enderDest/xMun', ''),
-                "UF": infNFe.findtext('.//dest/enderDest/UF', ''),
-                "Inscrição Estadual": infNFe.findtext('.//dest/IE', '')
-            },
-            "Valor total da Nota Fiscal": infNFe.findtext('.//total/ICMSTot/vNF', ''),
-            "Transportador": {
-                "Razao Social": infNFe.findtext('.//transporta/xNome', '') or infNFe.findtext('.//transporta/transporta/xNome', ''),
-                "Quantidade": infNFe.findtext('.//vol/qVol', ''),
-                "Especie": infNFe.findtext('.//vol/esp', '')
-            },
-            "Faturas": [{"Data de vencimento": d.findtext('dVenc', ''), "Valor": d.findtext('vDup', '')} for d in infNFe.findall('.//cobr/dup')],
-            "Produtos": [],
-            "Dados adicionais": {"Informações complementares": infNFe.findtext('.//infAdic/infCpl', '')}
+        content = xml_path.read_text(encoding='utf-8', errors='ignore')
+        content = re.sub(r'\sxmlns="[^"]+"', '', content, count=1)
+        root = ET.fromstring(content)
+        inf = root.find('.//infNFe')
+        if inf is None: return None
+        # Mapeamento simplificado para exemplo (mantém sua lógica anterior completa)
+        dados = {
+            "Dados da NF": {"Data": inf.findtext('.//ide/dhEmi', '')[:10], "Número da NF": inf.findtext('.//ide/nNF', ''), "Chave de Acesso da NF-E": inf.get('Id', '').replace('NFe', ''), "Natureza da operação": inf.findtext('.//ide/natOp', '')},
+            "Campos do destinatário": {"Nome/Razao Social": inf.findtext('.//dest/xNome', ''), "CNPJ/CPF": inf.findtext('.//dest/CNPJ', '') or inf.findtext('.//dest/CPF', ''), "Endereço": inf.findtext('.//dest/enderDest/xLgr', ''), "Bairro/Distrito": inf.findtext('.//dest/enderDest/xBairro', ''), "CEP": inf.findtext('.//dest/enderDest/CEP', ''), "Municipio": inf.findtext('.//dest/enderDest/xMun', ''), "UF": inf.findtext('.//dest/enderDest/UF', ''), "Inscrição Estadual": inf.findtext('.//dest/IE', '')},
+            "Valor total da Nota Fiscal": inf.findtext('.//total/ICMSTot/vNF', ''),
+            "Transportador": {"Razao Social": inf.findtext('.//transporta/xNome', ''), "Quantidade": inf.findtext('.//vol/qVol', ''), "Especie": inf.findtext('.//vol/esp', '')},
+            "Faturas": [{"Data de vencimento": d.findtext('dVenc', ''), "Valor": d.findtext('vDup', '')} for d in inf.findall('.//cobr/dup')],
+            "Produtos": []
         }
-        for det in infNFe.findall('.//det'):
+        for det in inf.findall('.//det'):
             prod = det.find('prod')
-            dados_json["Produtos"].append({
-                "Cod. Produto": prod.findtext('cProd', ''), "Descrição do prod/serv.": prod.findtext('xProd', ''), "NCM": prod.findtext('NCM', ''),
-                "CST": det.findtext('.//imposto//CST', ''), "CFOP": prod.findtext('CFOP', ''), "UN": prod.findtext('uCom', ''), "QUANT": prod.findtext('qCom', ''),
-                "V. UNITARIO": prod.findtext('vUnCom', ''), "V. TOTAL": prod.findtext('vProd', ''), "BC ICMS": det.findtext('.//imposto/ICMS//vBC', '0'),
-                "V ICMS": det.findtext('.//imposto/ICMS//vICMS', '0'), "V IPI": det.findtext('.//imposto/IPI//vIPI', '0'), "A ICMS": det.findtext('.//imposto/ICMS//pICMS', '0'), "A IPI": det.findtext('.//imposto/IPI//pIPI', '0')
-            })
-        return dados_json
+            dados["Produtos"].append({"Cod. Produto": prod.findtext('cProd', ''), "Descrição do prod/serv.": prod.findtext('xProd', ''), "NCM": prod.findtext('NCM', ''), "CST": det.findtext('.//imposto//CST', ''), "CFOP": prod.findtext('CFOP', ''), "UN": prod.findtext('uCom', ''), "QUANT": prod.findtext('qCom', ''), "V. UNITARIO": prod.findtext('vUnCom', ''), "V. TOTAL": prod.findtext('vProd', ''), "BC ICMS": det.findtext('.//imposto/ICMS//vBC', '0'), "V ICMS": det.findtext('.//imposto/ICMS//vICMS', '0'), "V IPI": det.findtext('.//imposto/IPI//vIPI', '0'), "A ICMS": det.findtext('.//imposto/ICMS//pICMS', '0'), "A IPI": det.findtext('.//imposto/IPI//pIPI', '0')})
+        dados["Dados adicionais"] = {"Informações complementares": inf.findtext('.//infAdic/infCpl', '')}
+        return dados
     except: return None
 
 def map_to_row(dados_json, source_type):
-    d = dados_json.get("Dados da NF", {}); de = dados_json.get("Campos do destinatário", {}); faturas = dados_json.get("Faturas", []); t = dados_json.get("Transportador", {}); p = dados_json.get("Produtos", [{}]); a = dados_json.get("Dados adicionais", {})
+    d = dados_json.get("Dados da NF", {}); de = dados_json.get("Campos do destinatário", {}); f = dados_json.get("Faturas", []); t = dados_json.get("Transportador", {}); p = dados_json.get("Produtos", [{}]); a = dados_json.get("Dados adicionais", {})
     f_row = []
     for i in range(8):
-        if i < len(faturas): f_row.extend([faturas[i].get("Data de vencimento", ""), faturas[i].get("Valor", "")])
+        if i < len(f): f_row.extend([f[i].get("Data de vencimento", ""), f[i].get("Valor", "")])
         else: f_row.extend(["", ""])
-    p1 = p[0] if len(p) > 0 else {}
     row = [d.get("Data", ""), d.get("Número da NF", ""), d.get("Chave de Acesso da NF-E", ""), d.get("Natureza da operação", ""), de.get("Nome/Razao Social", ""), de.get("CNPJ/CPF", ""), de.get("Endereço", ""), de.get("Bairro/Distrito", ""), de.get("CEP", ""), de.get("Municipio", ""), de.get("UF", ""), de.get("Inscrição Estadual", "")]
     row.extend(f_row)
-    row.extend([dados_json.get("Valor total da Nota Fiscal", ""), t.get("Razao Social", ""), t.get("Quantidade", ""), t.get("Especie", ""), p1.get("Cod. Produto", ""), p1.get("Descrição do prod/serv.", ""), p1.get("NCM", ""), p1.get("CST", ""), p1.get("CFOP", ""), p1.get("UN", ""), p1.get("QUANT", ""), p1.get("V. UNITARIO", ""), p1.get("V. TOTAL", ""), p1.get("BC ICMS", ""), p1.get("V ICMS", ""), p1.get("V IPI", ""), p1.get("A ICMS", ""), p1.get("A IPI", ""), a.get("Informações complementares", ""), source_type])
+    row.extend([dados_json.get("Valor total da Nota Fiscal", ""), t.get("Razao Social", ""), t.get("Quantidade", ""), t.get("Especie", ""), p[0].get("Cod. Produto", "") if p else "", p[0].get("Descrição do prod/serv.", "") if p else "", p[0].get("NCM", "") if p else "", p[0].get("CST", "") if p else "", p[0].get("CFOP", "") if p else "", p[0].get("UN", "") if p else "", p[0].get("QUANT", "") if p else "", p[0].get("V. UNITARIO", "") if p else "", p[0].get("V. TOTAL", "") if p else "", p[0].get("BC ICMS", "0") if p else "0", p[0].get("V ICMS", "0") if p else "0", p[0].get("V IPI", "0") if p else "0", p[0].get("A ICMS", "0") if p else "0", p[0].get("A IPI", "0") if p else "0", a.get("Informações complementares", ""), source_type])
     return row
 
 # ==========================================
-# PIPELINE
+# PIPELINE (ESTRITAMENTE SEQUENCIAL)
 # ==========================================
 def run_pipeline(drive_service, ai_client, sheet):
-    # 0. Faxina preventiva (Limpa pasta local e depois verifica arquivos antigos no Drive)
     for item in TMP_DIR.glob('*'): item.unlink()
+    processed_ids, processed_nfs = load_memories()
+    
     cleanup_old_files(drive_service)
-    
-    processed_ids = load_processed_ids()
+
     query = f"'{DRIVE_FOLDER_ID}' in parents and trashed = false"
-    results = drive_service.files().list(q=query, fields="files(id, name)", supportsAllDrives=True, includeItemsFromAllDrives=True).execute()
-    drive_files = results.get('files', [])
-    
+    drive_files = drive_service.files().list(q=query, fields="files(id, name)", supportsAllDrives=True, includeItemsFromAllDrives=True).execute().get('files', [])
     if not drive_files: return
-    logger.info(f"Ciclo: {len(drive_files)} arquivos encontrados na entrada.")
-    
+
+    logger.info(f"Ciclo iniciado: {len(drive_files)} arquivos encontrados.")
     drive_file_map = {} 
-    processed_nf_numbers = set()
 
+    # --- ETAPA 1: DOWNLOAD E TRIAGEM ---
     for f in drive_files:
-        name, fid = f['name'], f['id']
+        fid, name = f['id'], f['name']
         if fid in processed_ids: continue
+        
         if not name.lower().endswith(('.pdf', '.xml', '.zip')):
-            save_processed_id(fid)
-            archive_file(drive_service, fid, name)
-            continue
+            save_id_memory(fid); archive_file(drive_service, fid, name); continue
+
         if name.lower().endswith('.zip'):
-            local_zip = download_file_from_drive(drive_service, fid, name)
-            if local_zip:
-                try:
-                    with zipfile.ZipFile(local_zip, 'r') as z: z.extractall(TMP_DIR)
-                    save_processed_id(fid)
-                    archive_file(drive_service, fid, name)
-                except: logger.error(f"Erro ZIP {name}")
+            logger.info(f"Extraindo ZIP: {name}")
+            lz = download_file_from_drive(drive_service, fid, name)
+            if lz:
+                with zipfile.ZipFile(lz, 'r') as z: z.extractall(TMP_DIR)
+                save_id_memory(fid); archive_file(drive_service, fid, name)
+        else:
+            path = download_file_from_drive(drive_service, fid, name)
+            if path: drive_file_map[path] = fid
 
-    for f in drive_files:
-        if f['name'].lower().endswith(('.pdf', '.xml')) and f['id'] not in processed_ids:
-            path = download_file_from_drive(drive_service, f['id'], f['name'])
-            if path: drive_file_map[path] = f['id']
-
-    # XMLs
+    # --- ETAPA 2: PASSADA XML (Prioridade Total) ---
     for xml_path in TMP_DIR.glob('*.xml'):
         dados = process_with_xml(xml_path)
         if dados:
             nf = dados.get("Dados da NF", {}).get("Número da NF")
-            sheet.append_row(map_to_row(dados, "XML (Determinístico)"))
-            logger.info(f"SUCESSO XML: NF {nf}")
-            processed_nf_numbers.add(nf)
+            if nf in processed_nfs:
+                logger.info(f"NF {nf} (XML) já existe no histórico. Pulando.")
+            else:
+                sheet.append_row(map_to_row(dados, "XML (Determinístico)"))
+                logger.info(f"✅ SUCESSO XML: NF {nf}")
+                save_nf_memory(nf); processed_nfs.add(nf)
+            
             fid = drive_file_map.get(xml_path)
-            if fid:
-                save_processed_id(fid)
-                archive_file(drive_service, fid, xml_path.name)
+            if fid: save_id_memory(fid); archive_file(drive_service, fid, xml_path.name)
 
-    # PDFs
+    # --- ETAPA 3: PASSADA PDF (Somente o que o XML não cobriu) ---
     for pdf_path in TMP_DIR.glob('*.pdf'):
-        try:
-            doc = fitz.open(pdf_path)
-            for page in doc:
-                dados = process_with_ai(ai_client, page.get_text())
-                if dados:
-                    nf = dados.get("Dados da NF", {}).get("Número da NF")
-                    if nf not in processed_nf_numbers:
-                        sheet.append_row(map_to_row(dados, "PDF (IA Gemini)"))
-                        logger.info(f"SUCESSO IA: NF {nf}")
-                        processed_nf_numbers.add(nf)
-            doc.close()
-            fid = drive_file_map.get(pdf_path)
-            if fid:
-                save_processed_id(fid)
-                archive_file(drive_service, fid, pdf_path.name)
-        except Exception as e: logger.error(f"Erro PDF {pdf_path}: {e}")
+        doc = fitz.open(pdf_path)
+        for page in doc:
+            dados = process_with_ai(ai_client, page.get_text())
+            if dados:
+                nf = dados.get("Dados da NF", {}).get("Número da NF")
+                if nf in processed_nfs:
+                    logger.info(f"NF {nf} (PDF) ignorada: já processada por XML ou ciclo anterior.")
+                else:
+                    sheet.append_row(map_to_row(dados, "PDF (IA Gemini)"))
+                    logger.info(f"✅ SUCESSO IA: NF {nf}")
+                    save_nf_memory(nf); processed_nfs.add(nf)
+        doc.close()
+        fid = drive_file_map.get(pdf_path)
+        if fid: save_id_memory(fid); archive_file(drive_service, fid, pdf_path.name)
 
 def main():
-    logger.info("Iniciando Robô com Auto-Limpeza de 10 dias.")
+    logger.info("Robô Iniciado (V3 - Anti-Duplicidade de Negócio).")
     try:
-        sheet, drive_service, ai_client = init_services()
+        sheet, ds, ai = init_services()
         while True:
-            try: run_pipeline(drive_service, ai_client, sheet)
+            try: run_pipeline(ds, ai, sheet)
             except Exception as e: logger.error(f"Erro ciclo: {e}")
             time.sleep(15)
-    except KeyboardInterrupt: logger.info("Encerrado.")
     except Exception as e: logger.critical(f"Erro fatal: {e}")
 
 if __name__ == "__main__": main()
