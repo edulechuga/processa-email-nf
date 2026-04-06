@@ -38,6 +38,14 @@ Serviço Python para processar Notas Fiscais recebidas por e-mail e salvar no Go
    python main.py
    ```
 
+## Gerenciamento do Serviço (LXC Proxmox)
+
+No container, o serviço roda via **systemd**:
+- **Nome do serviço:** `nf-processor.service`
+- **Status:** `systemctl status nf-processor`
+- **Logs:** `journalctl -u nf-processor -f`
+- **Reiniciar:** `systemctl restart nf-processor`
+
 ## Permissões necessárias
 
 - Microsoft Graph API (e-mail)

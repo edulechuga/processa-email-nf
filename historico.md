@@ -148,8 +148,24 @@ sqlite3 ~/.n8n/database.sqlite "SELECT data FROM credentials_entity WHERE id='y3
 
 ### No servidor de destino:
 ```bash
+# Nome do Serviço: nf-processor.service
 # Rodar o serviço
 cd /opt/processa-email-nf
 source venv/bin/activate
 python main.py
+
+# Gerenciar via systemd
+systemctl status nf-processor
+systemctl cat nf-processor
+journalctl -u nf-processor -f
 ```
+
+## Configuração Observada do Serviço (06/04/2026)
+```ini
+[Service]
+WorkingDirectory=/opt/nf-processor
+ExecStart=/opt/processa-email-nf/venv/bin/python execution/main.py
+```
+*Obs: A configuração do ExecStart parece estar apontando para um local incorreto (execution/main.py), o que pode estar impedindo o início do serviço.* 
+
+## Linhas de Comando Úteis
